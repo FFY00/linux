@@ -396,13 +396,13 @@ struct uhid_create_req_compat {
 	__u32 country;
 } __attribute__((__packed__));
 
-static int uhid_event_from_user(const char __user *buffer, size_t len,
+static int uhid_event_from_iter(struct iov_iter *iter, size_t len,
 				struct uhid_event *event)
 {
 	if (in_compat_syscall()) {
 		u32 type;
 
-		if (get_user(type, buffer))
+		if (unlikely(!copy_from_iter_full(&type, sizeof(type), iter)))
 			return -EFAULT;
 
 		if (type == UHID_CREATE) {
@@ -417,10 +417,10 @@ static int uhid_event_from_user(const char __user *buffer, size_t len,
 			if (!compat)
 				return -ENOMEM;
 
-			buffer += sizeof(type);
 			len -= sizeof(type);
-			if (copy_from_user(compat, buffer,
-					   min(len, sizeof(*compat)))) {
+			if (unlikely(!copy_from_iter_full(compat,
+					   min(len, sizeof(*compat)),
+					   iter))) {
 				kfree(compat);
 				return -EFAULT;
 			}
@@ -450,16 +450,16 @@ static int uhid_event_from_user(const char __user *buffer, size_t len,
 		/* All others can be copied directly */
 	}
 
-	if (copy_from_user(event, buffer, min(len, sizeof(*event))))
+	if (unlikely(!copy_from_iter_full(event, min(len, sizeof(*event)), iter)))
 		return -EFAULT;
 
 	return 0;
 }
 #else
-static int uhid_event_from_user(const char __user *buffer, size_t len,
+static int uhid_event_from_iter(struct iov_iter *iter, size_t len,
 				struct uhid_event *event)
 {
-	if (copy_from_user(event, buffer, min(len, sizeof(*event))))
+	if (unlikely(!copy_from_iter_full(event, min(len, sizeof(*event)), iter)))
 		return -EFAULT;
 
 	return 0;
@@ -649,9 +649,10 @@ static int uhid_char_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-static ssize_t uhid_char_read(struct file *file, char __user *buffer,
-				size_t count, loff_t *ppos)
+static ssize_t uhid_char_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 {
+	struct file *file = iocb->ki_filp;
+	size_t count = iov_iter_count(iter);
 	struct uhid_device *uhid = file->private_data;
 	int ret;
 	unsigned long flags;
@@ -662,7 +663,7 @@ static ssize_t uhid_char_read(struct file *file, char __user *buffer,
 		return -EINVAL;
 
 try_again:
-	if (file->f_flags & O_NONBLOCK) {
+	if (file->f_flags & O_NONBLOCK || iocb->ki_flags & (IOCB_NOWAIT | IOCB_NOIO)) {
 		if (uhid->head == uhid->tail)
 			return -EAGAIN;
 	} else {
@@ -681,7 +682,7 @@ try_again:
 		goto try_again;
 	} else {
 		len = min(count, sizeof(**uhid->outq));
-		if (copy_to_user(buffer, uhid->outq[uhid->tail], len)) {
+		if (copy_to_iter(uhid->outq[uhid->tail], len, iter)) {
 			ret = -EFAULT;
 		} else {
 			kfree(uhid->outq[uhid->tail]);
@@ -697,9 +698,11 @@ try_again:
 	return ret ? ret : len;
 }
 
-static ssize_t uhid_char_write(struct file *file, const char __user *buffer,
-				size_t count, loff_t *ppos)
+
+static ssize_t uhid_char_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 {
+	struct file *file = iocb->ki_filp;
+	size_t count = iov_iter_count(iter);
 	struct uhid_device *uhid = file->private_data;
 	int ret;
 	size_t len;
@@ -715,7 +718,7 @@ static ssize_t uhid_char_write(struct file *file, const char __user *buffer,
 	memset(&uhid->input_buf, 0, sizeof(uhid->input_buf));
 	len = min(count, sizeof(uhid->input_buf));
 
-	ret = uhid_event_from_user(buffer, len, &uhid->input_buf);
+	ret = uhid_event_from_iter(iter, len, &uhid->input_buf);
 	if (ret)
 		goto unlock;
 
@@ -780,8 +783,8 @@ static const struct file_operations uhid_fops = {
 	.owner		= THIS_MODULE,
 	.open		= uhid_char_open,
 	.release	= uhid_char_release,
-	.read		= uhid_char_read,
-	.write		= uhid_char_write,
+	.read_iter	= uhid_char_read_iter,
+	.write_iter	= uhid_char_write_iter,
 	.poll		= uhid_char_poll,
 	.llseek		= no_llseek,
 };
